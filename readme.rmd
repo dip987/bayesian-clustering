@@ -1,0 +1,421 @@
+---
+title: "Clustering on Rental Properties Around Davis"
+author: "Rishad Raiyan"
+date: "3/17/2022"
+output: rmarkdown::github_document
+---
+
+```{r message=FALSE, echo=FALSE}
+library(tidyverse)
+library(rvest)
+library(mclust)
+```
+
+# Introduction
+
+Finding a good place to live is a big challenge faced by every UC Davis students on a regular basis. We attempt to make this decision easier for them with the help of some Bayesian statistics. In this report, we present recommendations based on clustering methods and provide data visualization so renters can make an informed decision. The data for rental apartments are collected from two different sites, Zillow and Trulia. We compiled listings for three cities - Davis, Elk Grove & Sacramento. All the steps in data collection, record linkage, data clean-up, exploration and clustering are explained in details. 
+
+# Method
+
+## Data Collection
+
+### Collecting Data from Trulia
+
+Trulia is Realtor website. It lists both houses for sale and rent. The interface looks like this
+
+![Trulia Website]("trulia_ss.png")
+
+A sample Scarping code plus the data clean-up steps are given below.
+```{r message=FALSE}
+# Sample Code for Scrapping
+## Davis Trulia Links
+trulia_links_davis = sprintf("https://www.trulia.com/for_rent/Davis,CA/%d_p/", 1:2)
+trulia_links_elk = sprintf("https://www.trulia.com/for_rent/Elk_Grove,CA/%d_p/", 1:2)
+trulia_links_sac = sprintf("https://www.trulia.com/for_rent/Sacramento,CA/%d_p/", 1:16)
+
+scraping_function = function(link){
+  # Select Card Nodes
+  card_nodes = read_html(link) %>% 
+    html_nodes("div[data-testid=property-card-details]")
+  # House Area
+  house_a = card_nodes %>% 
+    html_node("div > div > div[data-testid=property-floorSpace]") %>% 
+    html_text() %>% readr::parse_number()
+  # Beds(With Ranges)
+  beds = card_nodes %>% 
+    html_node("div > div > div[data-testid=property-beds]") %>% html_text() %>%
+    str_remove_all("bd")
+  # Baths(With Ranges)
+  baths = card_nodes %>% 
+    html_node("div > div > div[data-testid=property-baths]") %>% 
+    html_text() %>% 
+    str_remove_all("ba")
+  # Price(With Ranges)
+  price = card_nodes %>% 
+    html_node("div > div > div[data-testid=property-price]") %>% 
+    html_text() %>% 
+    str_remove_all("\\$") %>% 
+    str_remove_all(",") %>% 
+    str_remove_all("/mo")
+  # Separate the ranges, take care of Studio Apartments
+  output = tibble(price = price, beds= beds, baths=baths, house_area = house_a) %>%
+    separate_rows(price, beds, baths, sep="-", convert=TRUE) %>% 
+    mutate(is_studio = (beds == 'Studio')) %>% 
+    mutate(beds = replace(beds, beds=='Studio', 1))%>% 
+    mutate(beds=as.numeric(beds), price=as.numeric(price), baths=as.numeric(baths))
+  # Take care of Semi-Bathrooms
+  output = output %>% 
+    mutate(semi_bath = ((baths%%1) != 0)) %>% 
+    mutate(baths = floor(baths))
+  return(output)
+}
+
+results_davis = purrr::map(trulia_links_davis, scraping_function )%>%
+  bind_rows() %>% 
+  mutate(City = 'Davis')
+results_elk = purrr::map(trulia_links_elk, scraping_function )%>%
+  bind_rows() %>% 
+  mutate(City = 'Elk Grove')
+results_sac = purrr::map(trulia_links_sac, scraping_function )%>% 
+  bind_rows() %>% 
+  mutate(City = 'Sacramento')
+
+combined_trulia = bind_rows(results_davis, results_elk, results_sac)
+```
+
+Here, Some of the apartments are listed as Studio. This is given under the number of bed rooms. The data was cleaned such that the number of bedrooms for a studio is set to 1. Which is a reasonable simplification. We also have a new variable is_studio per row, telling us if the listing was in fact a studio apartment or a regular apartment. 
+
+Furthermore, some apartments had a range of listings in a single card. The only way to reveal all the all the listings hidden beneath, is to go into site for that listing and then do another round of web scrapping to get the additional information. We tried doing this initially, but the website's anti-botting system blocked my code from running. So as a work-around, each range of listings was split up into two separate entries. One corresponding to the lower price point and the other corresponding to the higher price point. For these entries, the number beds/baths and the floor space also had a corresponding range. The data was split up such that the lower price point corresponded to the lower limit of beds, baths and floor space and the upper price point corresponded to the upper limit. Although a little bit inaccurate, this way at least we could gain some data rather than none. There might have been some apartment listed in between those price points which we were unable to scrap. 
+
+Some of the apartments had a bathroom listing as a fractional number. For example, "1.5" or "2.5". This corresponds to a semi-bathroom/single sink somewhere in the house. We modified this as a completely separate column called semi-bathroom. The actual number of bathrooms is listed in the baths. With this modification, the number of beds is actually a *floor* operation of the listed values. 
+
+A look at the first few data points of the final data is given below
+```{r echo=FALSE}
+combined_trulia %>% slice_head(n=10)
+```
+
+
+A simple summary of the data is also given below. 
+```{r echo=FALSE, message=FALSE}
+combined_trulia %>% group_by(City, beds) %>%
+  summarise(mean_rent=mean(price, na.rm = TRUE), mean_house_area=mean(house_area, na.rm=TRUE))
+```
+
+### Collecting Data From Zillow
+
+Zillow is another famous Realtor website. It also has a wide listing of rentals available. The search page for zillow looks like this.
+
+![Zillow Website]("zillow_ss.png")
+
+The code for scrapping data from the zillow site is given below
+```{r}
+zillow_links_davis = "https://www.zillow.com/davis-ca/apartments/"
+zillow_links_elk = "https://www.zillow.com/elk-grove-ca/apartments/"
+zillow_links_sac = sprintf("https://www.zillow.com/sacramento-ca/apartments/%d_p", 1:7)
+
+scraping_function2 = function(link){
+  # select houses
+  houses <- read_html(link) %>%
+    html_nodes(".photo-cards li article")
+  z_id <- houses %>%
+    html_attr("id")
+  # address 
+  address <- houses %>%
+    html_node(".list-card-addr") %>%
+    html_text()
+  # price
+  price <- houses %>%
+    html_node(".list-card-price") %>%
+    html_text() %>%
+    readr::parse_number()
+  # info
+  params <- houses %>%
+    html_node(".list-card-info") %>%
+    html_text2()
+  # Studio
+  is_studio = params %>% str_detect('[Ss]tudio')
+  # number of bedrooms
+  beds <- params %>%
+    str_extract("\\d+(?=\\s*bds)") %>%
+    as.numeric()
+  # number of bathrooms
+  baths <- params %>%
+    str_extract("\\d+(?=\\s*ba)") %>%
+    as.numeric()
+  # total square footage
+  house_a <- params %>%
+    str_extract("[0-9,]+(?=\\s*sqft)") %>%
+    str_replace(",", "") %>%
+    as.numeric()
+ 
+  tibble(price = price, beds= beds, baths=baths, house_area = house_a, is_studio=is_studio)
+}
+
+results_davis = purrr::map(zillow_links_davis, scraping_function2 )%>% 
+  bind_rows() %>% 
+  mutate(City = 'Davis')
+results_elk = purrr::map(zillow_links_elk, scraping_function2 )%>% 
+  bind_rows() %>% 
+  mutate(City = 'Elk Grove')
+results_sac = purrr::map(zillow_links_sac, scraping_function2 )%>% 
+  bind_rows() %>% 
+  mutate(City = 'Sacramento')
+
+combined_zillow = bind_rows(results_davis, results_elk, results_sac)
+
+```
+
+The final data from zillow
+```{r echo=FALSE}
+combined_zillow = combined_zillow %>% mutate(semi_bath=FALSE)
+combined_zillow %>% slice_head(n=10)
+```
+
+
+One thing to notice is that in the zillow site never lists semi-bathrooms. Which makes it harder to combine data between these two datasets. Looking at the data from the Trulia site, it is apparent that most rentals do not have semi-baths. Apartments with a semi-bath is $55/359 = 0.15 = 15%$. To make it easier to merge these two datasets, we assume that none of the apartments from the Zillow listing have semi-baths.
+
+We can get some similar statistics about this dataset. It is shown below
+```{r echo=FALSE}
+combined_zillow %>% group_by(City, beds) %>% summarise(mean_rent=mean(price, na.rm = TRUE), mean_house_area=mean(house_area, na.rm=TRUE))
+```
+This summary reveals to us that this dataset has a bunch of rows where even the price of the rental is not listed on the website. We discard these rows from our final data.
+
+```{r echo=FALSE, message=FALSE}
+combined_zillow = combined_zillow %>% filter(!is.na(price))
+```
+```{r echo=FALSE, message=FALSE}
+combined = full_join(combined_trulia, combined_zillow)
+```
+
+## Data Exploration
+
+Once we have the combined data from both sites, we can move on to figuring out patterns with the data.
+
+When choosing an apparent, first thing a person needs to decide on is the number of bedrooms or the size of the apartment. Depending on if they are living alone, with friends or with family - the requirements will be different. The second most important issues will be the rent and the distance from university. We start looking at this data by plotting these variables using 'GGPLOT2'
+
+```{r echo=FALSE, message=FALSE}
+library(ggplot2)
+```
+
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined, aes(x=house_area, y=price)) +
+  geom_jitter(aes(col=City, size=beds))
+
+```
+Unsurprisingly, rent of the houses go up with the square feet of the house. So does the number of bedrooms. This plot has very few outliers.
+
+We can make the same plot for number of baths instead of bedrooms.
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined, aes(x=house_area, y=price)) +
+  geom_jitter(aes(col=City, size=baths))
+
+```
+These two plots are pretty similar. 
+
+It is pretty evident that houses in Davis are just in general costlier than both Sacramento and Elk Grove. If we would have taken other towns close to Davis, for example Dixon or Woodland, we would still see a pretty similar pattern. This kind of allows to classify if a house belongs in Davis or somewhere else just by seeing its rent vs. house size.
+
+Another interesting thing to look at is the price-per-sq. feet distribution at different cities.
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined, aes(x=price/house_area)) +
+  geom_density(aes(col=City, fill=City), alpha=0.3)
+```
+
+We can also look at the difference in rent between Studio apartments and single bedroom apartments. Realistically, these two types of houses will be of interest to the same demographic of people. Interestingly enough, the rent for studio apartments are lower than their single bedroom counterpart. 
+```{r echo=FALSE, message=FALSE}
+temp_data = combined %>% filter(beds==1)
+ggplot(temp_data, aes(x=price)) +
+  geom_density(aes(col=is_studio, fill=is_studio), alpha=0.4)
+
+```
+We would have like to do a plot showing the price vs. area for these two types of apartments. However, for most of the studio apartments, the area is missing. This might point to some strange phenomena where renters do not like listing the size of their studio apartments. Or it could be just that the data we have co-incidentally is like this. Considering we are working with a relatively small sample of data, the later is not unlikely.
+
+We can also look at the availability of houses at a certain price point at each city. This gives a general idea about which types of houses are more common in a specific place. This information can come in handy to someone who's trying to decide which city to live in during. It can answer questions like is it cheaper to stay in a different town and commute to Davis or just stay in Davis despite a higher rent.
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined %>% filter(beds==1), aes(x=price)) +
+  #geom_histogram(aes(y=..density.., col=City, fill=City), alpha=0.3, binwidth=100) +
+  geom_density(aes(col=City, fill=City), alpha=0.3) +
+  xlab("Single Bedroom - Rent")
+```
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined %>% filter(beds==2), aes(x=price, fill=City, col=City)) +
+  #geom_histogram(alpha=0.3, binwidth=200) +
+  geom_density(aes(col=City, fill=City), alpha=0.3) + 
+  xlab("Double Bedroom - Rent") +
+  xlim(1000, 3500)
+```
+
+```{r echo=FALSE, message=FALSE}
+ggplot(data=combined %>% filter(beds==3), aes(x=price)) +
+  #geom_histogram(aes(col=City, fill=City), alpha=0.3, binwidth=200) +
+  
+  geom_density(aes(col=City, fill=City), alpha=0.3) + 
+  xlab("Triple Bedroom - Rent")
+```
+It looks like in general, there are more cheaper options available in Sacramento & Elk Grove compared to Davis. 
+
+Based on these information, for fitting purposes, we change the *City* variable to factors. With Davis being the highest and Elk Grove being the lowest level.
+
+```{r echo=FALSE, message=FALSE}
+combined = combined %>% mutate(City = factor(City, levels=c('Elk Grove', 'Sacramento', 'Davis')))
+```
+
+
+
+## Clustering
+
+In this section, we want to look into clustering to determine if we can offer the user other houses similar to the ones they are already looking at.
+
+### K-Means Clustering
+
+Before we go into Bayesian methods, we want to explore K-means clustering. This gives us more information about the data and what sort of clustering would make sense. The knowledge we gain from here can later be used in Bayesian clustering to give us an edge.
+
+First we need to choose a K i.e. the number of clusters for the algorithm. This is done by determining WSS for different values of K. We plot K for fitting price and size of each house down below.
+
+```{r echo=FALSE, message=FALSE}
+wss = list()
+for (k in seq(1, 10)){
+  cluster.kmeans = stats::kmeans(combined %>% dplyr::select(price, house_area) %>% drop_na(), k)
+  wss[[k]] = cluster.kmeans$tot.withinss
+}
+plot(seq(1, 10), wss, xlab="K")
+title(main = "Within Sum-of-Squres For different Values of K in Clustering")
+```
+From this plot, it makes sense to choose $ K = 5 $ for clustering. At least in terms of the K-Means clustering. We plot the centers.
+
+```{r echo=FALSE, message=FALSE}
+cluster.kmeans = stats::kmeans(combined %>% dplyr::select(price, house_area) %>%
+                                 drop_na(), 5)
+plot(cluster.kmeans$centers, xlab="House Price Of Cluster Centers", ylab="House Area for Cluster Centers")
+title("Cluster Centers")
+```
+
+We repeat the same process, but this time taking all the columns into consideration. 
+
+```{r echo=FALSE, message=FALSE}
+wss = list()
+for (k in seq(1, 10)){
+  cluster.kmeans = stats::kmeans(combined %>%
+                                   dplyr::select(beds, baths, house_area, price) %>%
+                                   drop_na(), k)
+  wss[[k]] = cluster.kmeans$tot.withinss
+}
+
+plot(seq(1, 10), wss, xlab="K")
+title(main = "Within Sum-of-Squres For different Values of K in Clustering")
+```
+
+Even for this approach, we get similar best K at 5. The cluster means are given below
+```{r echo=FALSE, message=FALSE}
+cluster.kmeans = stats::kmeans(combined %>% 
+                                 dplyr::select(beds, baths, house_area, price) %>%
+                                 drop_na(), 5)
+print(cluster.kmeans$centers)
+```
+
+
+## Bayesian Approach
+
+We now shift our focus to a Bayesian approach. Before we can start clustering, we need to determine what sort of variance-covariance matrix would work best for this approach. After this step, we retry different values of K and check their respective BICs. The final model with this new K and variance-covariance matrix is chosen as our clustering algorithm.
+
+Before moving on, we actually tried clustering for all the variables available. The clustering algorithm seemed to fail for some of the cases. Which is why we decided to focus only on the price and the house_area.
+
+
+Looking at the cluster centers and the data, it is reasonable to assume the clusters should be ellipsoidal. We only check out the BIC for these forms. We fit the models and print out the results below.
+
+```{r}
+mat_types = c('EEE', 'EVE', 'VEE', 'EEV', 'VVE', 'EVV', 'VEV', 'VVV')
+all_BIC = list()
+for (mat_type in mat_types){
+  df.Mclust2 <- Mclust (combined %>% dplyr::select(price, house_area) %>% 
+                          drop_na(), model=mat_type, G=5)
+  print(paste(mat_type, " BIC = ", df.Mclust2$BIC))
+}
+```
+
+"VEV" Seems to give us the better BIC from the fitting. 
+
+
+Next we try out different K values and plot the corresponding BICs.
+
+```{r}
+all_BIC = list()
+for (k in seq(1, 10)){
+  df.Mclust2 <- Mclust (combined %>% dplyr::select(price, house_area,) %>%
+                          drop_na(), model="VEV", G=k)
+  all_BIC = c(all_BIC, df.Mclust2$BIC[1])
+}
+```
+
+```{r echo=FALSE}
+plot(seq(1, 10), all_BIC, xlab="K", ylab="BIC")
+title(main = "BIC for Different K values")
+```
+This plot actually seems to suggest K = 4 is a better for for the given data. (Take into account that these clusters are made with only 2 parameters, the area of the house and the price taken into consideration).
+
+Next we apply expectation maximization algorithm on this. 
+
+```{r echo=FALSE}
+df2 <- combined %>% dplyr::select(price, house_area) %>% drop_na()
+nb = 6
+par(mfrow=c(2,3))
+res = list(); likelihood = c()
+myModel = Rmixmod::mixmodGaussianModel(listModels='Gaussian_pk_Lk_Ck')
+for (i in 1:nb){
+  res[[i]] = Rmixmod::mixmodCluster(df2,nbCluster=4,model=myModel ,
+                           strategy=Rmixmod::mixmodStrategy(initMethod='random' ,nbTryInInit=1,
+                          nbIterationInInit=1,nbIterationInAlgo=1))
+  likelihood[i] = res[[i]]@bestResult@likelihood
+    plot(df2,col=res[[i]]@bestResult@partition+1,pch=c(17,19, 22, 24)[
+    res[[i]]@bestResult@partition])
+  title(main=paste('Likelihood =',round(likelihood[i]))) }
+```
+
+Plotting the only best one, 
+
+```{r echo=FALSE}
+
+par(mfrow=c(1,1))
+final.res = res[[which.max(likelihood)]]
+plot(df2,col=final.res@bestResult@partition+1,pch=c(17,19, 22, 24)[
+  final.res@bestResult@partition])
+title(main=paste('Likelihood =',round(
+  final.res@bestResult@likelihood)))
+```
+
+
+We also wanted to look at the clustering for $K=5$. AS that was the value suggested by our frequentist analysis.
+
+```{r echo=FALSE}
+df2 <- combined %>% dplyr::select(price, house_area) %>% drop_na()
+nb = 6
+par(mfrow=c(2,3))
+res = list(); likelihood = c()
+myModel = Rmixmod::mixmodGaussianModel(listModels='Gaussian_pk_Lk_Ck')
+for (i in 1:nb){
+  res[[i]] = Rmixmod::mixmodCluster(df2,nbCluster=5,model=myModel ,
+                           strategy=Rmixmod::mixmodStrategy(initMethod='random' ,nbTryInInit=1,
+                          nbIterationInInit=1,nbIterationInAlgo=1))
+  likelihood[i] = res[[i]]@bestResult@likelihood
+    plot(df2,col=res[[i]]@bestResult@partition+1,pch=c(17,19, 22, 24, 25)[
+    res[[i]]@bestResult@partition])
+  title(main=paste('Likelihood =',round(likelihood[i]))) }
+```
+
+It is pretty evident that the likelihood values for $ K =5$ is in general larger than $K=4$. So for this context, $K=4$ was the better option.
+
+
+Finally we plot the uncertainty for our estimations.
+
+
+```{r echo=FALSE}
+df.Mclust2 <- Mclust (df2, model="VEV",G=4)
+plot(df.Mclust2 ,what="uncertainty")
+```
+
+# Conclusion
+
+In this report, we provide visualizations and recommendations for future renters. We aim to provide them logistical data about rent, house specifications and availability to make informed decisions before picking an apartment.
+
+In the report, we show the different states of data collection, cleanup and record linkage. Afterwards, we use the gathered data to make some decision about the housing market in the area near Davis.For example, we show that studio apartments are in general cheaper than one-bedroom ones and that houses in Davis are on average more expensive than the cities nearby. This trend is persists for all types of houses. We also provide a clustering based recommendation system for checking out other similar houses in a similar price point. 
+
+
